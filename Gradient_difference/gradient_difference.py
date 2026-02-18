@@ -47,7 +47,7 @@ def gradient_difference(master_img_path, test_img_path, image_id):
     test_grad = gradient_magnitude(test_clahe)
 
     # Differences of the gradients between the master and the test images
-    diff_grad = cv2.absdiff(master_grad, test_grad)
+    diff_grad = cv2.subtract(master_grad, test_grad)
 
     # Thresholding the difference image
     _, thresh = cv2.threshold(diff_grad, 30, 255, cv2.THRESH_BINARY)
