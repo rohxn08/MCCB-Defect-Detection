@@ -87,13 +87,15 @@ def main():
         return
 
     if master_img.shape[:2] != test_img.shape[:2]:
-        print("WARNING: Image sizes don't match!")
-        return
+        master_h, master_w = master_img.shape[:2]
+        test_h, test_w = test_img.shape[:2]
+        print(f"Resizing test image from ({test_w}x{test_h}) to ({master_w}x{master_h})")
+        test_img = cv2.resize(test_img, (master_w, master_h))
 
     # Preprocess once
     master_grad = preprocess(master_img)
     test_grad   = preprocess(test_img)
-    diff_grad   = cv2.absdiff(master_grad, test_grad)
+    diff_grad   = cv2.subtract(master_grad, test_grad)
 
     # Initial values
     init_thresh   = 30
