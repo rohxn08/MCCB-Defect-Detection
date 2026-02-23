@@ -43,6 +43,24 @@ class RobustMCCBPipeline:
             return sy, sy + sh
         return None, None
 
+    def extract_top_lines(self, ocr_results, y_max):
+        """
+        Collects raw OCR text lines whose vertical centre is above y_max.
+        These are the top-section lines (logo, product name, serial number).
+        Returns: list of strings sorted top-to-bottom.
+        """
+        top_items = []
+        for line in ocr_results:
+            box = line[0]
+            text = line[1][0]
+            cy = sum([p[1] for p in box]) / 4
+            if cy < y_max:
+                top_items.append({"text": text, "cy": cy})
+
+        # Sort top-to-bottom and return just the text strings
+        top_items.sort(key=lambda k: k['cy'])
+        return [item['text'] for item in top_items]
+
     def extract_table(self, ocr_results, y_min, y_max):
         """
         Extracts and structures table data from OCR results within the vertical range [y_min, y_max].
@@ -127,13 +145,34 @@ class RobustMCCBPipeline:
         
         # Define Regions
         if switch_top:
-            # Table is above switch (Stop at switch top)
-            table_y_min = int(h * 0.05)
             table_y_max = switch_top
             
             # Rating can be ON the switch (XT-series) or BELOW it (P-series)
             rating_y_min = switch_top
             rating_y_max = int(h * 0.95)
+
+            # Dynamically detect where the table starts by finding the
+            # first known electrical-parameter header (Ue, Icu, Ics, Ui, Uimp).
+            # Everything above that line is the top section (product name, S/N).
+            table_header_pattern = re.compile(
+                r'^(Ue|Icu|Ics|Ui|Uimp)\b', re.IGNORECASE
+            )
+            # Collect candidate lines above the switch, sorted by Y
+            above_switch = []
+            for line in all_lines:
+                box = line[0]
+                text = line[1][0]
+                cy = sum([p[1] for p in box]) / 4
+                if cy < switch_top:
+                    above_switch.append({"text": text, "cy": cy})
+            above_switch.sort(key=lambda k: k['cy'])
+
+            # Find the Y of the first table-header keyword
+            table_y_min = int(h * 0.05)  # fallback
+            for item in above_switch:
+                if table_header_pattern.match(item['text'].strip()):
+                    table_y_min = max(0, int(item['cy']) - 20)  # small margin above
+                    break
         else:
             # Fallback
             print("  Warning: Switch not detected. Using full image search.")
@@ -148,17 +187,19 @@ class RobustMCCBPipeline:
         vis_img = img.copy()
         # Draw Switch (if found)
         if switch_top:
-            # Re-find contour just for vis (or pass it back, but simple rect is enough)
-            # We know Ys, we can guess Xs or just draw horizontal lines
-            cv2.line(vis_img, (0, switch_top), (w, switch_top), (0, 0, 255), 5) # Red Line Top
-            cv2.line(vis_img, (0, switch_bottom), (w, switch_bottom), (0, 0, 255), 5) # Red Line Bottom
+            cv2.line(vis_img, (0, switch_top), (w, switch_top), (0, 0, 255), 5)
+            cv2.line(vis_img, (0, switch_bottom), (w, switch_bottom), (0, 0, 255), 5)
             cv2.putText(vis_img, "SWITCH AREA", (10, switch_top - 10), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
+
+        # Draw Top Section ROI (Yellow)
+        cv2.rectangle(vis_img, (5, 0), (w-5, table_y_min), (0, 255, 255), 4)
+        cv2.putText(vis_img, "TOP ROI", (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 3)
 
         # Draw Table ROI (Green)
         cv2.rectangle(vis_img, (10, table_y_min), (w-10, table_y_max), (0, 255, 0), 4)
         cv2.putText(vis_img, "TABLE ROI", (50, table_y_min + 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
 
-        # Draw Rating ROI (Blue) - Slightly inset to show overlap
+        # Draw Rating ROI (Blue)
         cv2.rectangle(vis_img, (20, rating_y_min), (w-20, rating_y_max), (255, 0, 0), 4)
         cv2.putText(vis_img, "RATING ROI", (50, rating_y_max - 20), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 3)
 
@@ -166,6 +207,9 @@ class RobustMCCBPipeline:
         # --- VISUALIZATION END ---
 
         # 3. Extract Data
+        # Top-section lines (product name, serial number, etc.)
+        top_lines = self.extract_top_lines(all_lines, table_y_min)
+
         # Rating
         rating_val = self.extract_rating_from_roi(all_lines, rating_y_min, rating_y_max)
         
@@ -174,6 +218,7 @@ class RobustMCCBPipeline:
         
         return {
             "filename": filename,
+            "top_lines": top_lines,
             "rating": rating_val,
             "table_data": table_rows
         }
