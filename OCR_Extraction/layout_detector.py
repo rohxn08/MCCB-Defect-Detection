@@ -1,9 +1,10 @@
 
 import cv2
 import numpy as np
+import re
 import os
 
-def detect_layout_regions(image_path, output_dir):
+def detect_layout_regions(image_path, output_dir, ocr_lines=None):
     filename = os.path.basename(image_path)
     img = cv2.imread(image_path)
     if img is None:
@@ -53,14 +54,33 @@ def detect_layout_regions(image_path, output_dir):
         sx, sy, sw, sh = cv2.boundingRect(switch_contour)
         
         # Define Regions
-        # Table counts as roughly Top 10% to Switch Top
-        # We assume the logo is at the very top, so we start below it (e.g., 10% or detected logo bottom)
-        table_roi_y1 = int(h * 0.1) 
+        # Table: default start at 10% of image height
+        table_roi_y1 = int(h * 0.1)
         table_roi_y2 = sy 
         
-        # Rating counts as Switch Bottom to Bottom 10% (Barcode area)
-        rating_roi_y1 = sy + sh
-        rating_roi_y2 = int(h * 0.9)
+        # If OCR lines are provided, refine table start by finding
+        # the first known electrical-parameter header (Ue, Icu, Ics, Ui, Uimp)
+        if ocr_lines:
+            table_header_pattern = re.compile(r'^(Ue|Icu|Ics|Ui|Uimp)\b', re.IGNORECASE)
+            above_switch = []
+            for line in ocr_lines:
+                box = line[0]
+                text = line[1][0]
+                cy_line = sum([p[1] for p in box]) / 4
+                if cy_line < sy:
+                    above_switch.append({"text": text, "cy": cy_line})
+            above_switch.sort(key=lambda k: k['cy'])
+            
+            for item in above_switch:
+                if table_header_pattern.match(item['text'].strip()):
+                    table_roi_y1 = max(0, int(item['cy']) - 20)
+                    break
+        
+        # Rating: from switch top to bottom 95%
+        # Uses switch TOP (not bottom) because XT-series ratings
+        # are printed on the switch itself
+        rating_roi_y1 = sy
+        rating_roi_y2 = int(h * 0.95)
         
         # VISUALIZATION
         # Draw Switch Box (Red)
