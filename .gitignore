@@ -2,3 +2,4 @@
 /venv
 *.txt
 *.json
+__pycache__/
