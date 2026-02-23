@@ -8,7 +8,7 @@ def detect_layout_regions(image_path, output_dir):
     img = cv2.imread(image_path)
     if img is None:
         print(f"Failed to load: {image_path}")
-        return
+        return None
     
     vis_img = img.copy()
     h, w = img.shape[:2]
@@ -77,14 +77,24 @@ def detect_layout_regions(image_path, output_dir):
         
         print(f"[{filename}] SUCCESS - Switch found at Y={sy}")
         
+        # Return ROI data for pipeline use
+        regions = {
+            "switch": (sy, sy + sh),
+            "table":  (table_roi_y1, table_roi_y2),
+            "rating": (rating_roi_y1, rating_roi_y2),
+        }
+        
     else:
         print(f"[{filename}] FAILED - No switch detected")
+        regions = None
         
     # Save debug image
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     output_path = os.path.join(output_dir, f"layout_{filename}")
     cv2.imwrite(output_path, vis_img)
+    
+    return regions
 
 if __name__ == "__main__":
     # Adjust paths relative to where the script is run (project root or folder)
