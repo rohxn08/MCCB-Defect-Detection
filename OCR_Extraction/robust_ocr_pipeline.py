@@ -146,42 +146,80 @@ class RobustMCCBPipeline:
 if __name__ == "__main__":
     pipeline = RobustMCCBPipeline()
     
+    print("\n" + "="*50)
+    print("  ROBUST MCCB OCR PIPELINE")
+    print("="*50)
+
+    choice = input("Do you want to process a single image (1) or a directory (2)? [1/2]: ").strip()
+
     # Adjust path
     project_root = os.getcwd()
     if "OCR_Extraction" in project_root:
         project_root = os.path.dirname(project_root)
         
-    input_dir = os.path.join(project_root, "images", "master_mccb")
+    # Output directory
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+    os.makedirs(output_dir, exist_ok=True)
     
-    if os.path.exists(input_dir):
-        files = [f for f in os.listdir(input_dir) if f.startswith("master") and f.lower().endswith(('.png', '.jpg'))]
+    images_to_process = []
+    
+    if choice == '1':
+        img_path = input("Enter the full path to the image: ").strip()
+        # Remove surrounding quotes if dragged-and-dropped in terminal
+        img_path = img_path.strip('\'"')
+        if os.path.isfile(img_path):
+            images_to_process.append(img_path)
+        else:
+            print(f"Invalid image path: {img_path}")
+    elif choice == '2':
+        default_dir = os.path.join(project_root, "images", "master_mccb")
+        input_dir = input(f"Enter directory path [Press Enter for default: {default_dir}]: ").strip()
+        if not input_dir:
+            input_dir = default_dir
+        else:
+            input_dir = input_dir.strip('\'"')
+            
+        if os.path.isdir(input_dir):
+            files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            images_to_process.extend([os.path.join(input_dir, f) for f in files])
+        else:
+            print(f"Directory not found: {input_dir}")
+    else:
+        print("Invalid choice. Please enter 1 or 2.")
         
-        print("\n" + "="*50)
-        print("  ROBUST MCCB OCR PIPELINE")
-        print("="*50)
+    if images_to_process:
+        print(f"\nFound {len(images_to_process)} image(s) to process.")
         
-        results = {}
-        
-        for f in files:
-            image_path = os.path.join(input_dir, f)
-            raw_data = pipeline.process_image(image_path)
+        for img_path in images_to_process:
+            filename = os.path.basename(img_path)
+            raw_data = pipeline.process_image(img_path)
             
             if raw_data is None:
-                print(f"  ⚠ Skipped {f} (no data)")
+                print(f"  ⚠ Skipped {filename} (no data extracted)")
                 continue
             
-            results[f] = format_image_result(raw_data)
-        
-        # Pretty print to console
-        print("\n" + json.dumps(results, indent=2))
-        
-        # Save to file
-        output_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "results.json"
-        )
-        with open(output_path, "w") as fh:
-            json.dump(results, fh, indent=2)
-        
-        print(f"\n✓ Saved structured JSON to {output_path}")
-    else:
-        print("Input directory not found.")
+            # Format JSON
+            formatted_data = format_image_result(raw_data)
+            
+            # Determine filename
+            serial_number = formatted_data.get("serial_number")
+            
+            # Clean serial number for filesystem if it exists
+            if serial_number:
+                # Remove any characters that might be invalid in filenames
+                safe_sn = "".join(c for c in serial_number if c.isalnum() or c in ('-', '_')).strip()
+                if safe_sn:
+                    out_name = f"{safe_sn}.json"
+                else:
+                    out_name = f"{os.path.splitext(filename)[0]}.json"
+            else:
+                out_name = f"{os.path.splitext(filename)[0]}.json"
+                
+            out_path = os.path.join(output_dir, out_name)
+            
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(formatted_data, fh, indent=2, ensure_ascii=False)
+                
+            print(f"\n  ✓ Result JSON:")
+            print(json.dumps(formatted_data, indent=2, ensure_ascii=False))
+            print(f"  ✓ Saved {filename} results to: {out_path}\n")
