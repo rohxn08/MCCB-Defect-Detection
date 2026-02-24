@@ -5,14 +5,20 @@ Provides functions to normalize, pivot, and clean OCR-extracted table data
 into structured JSON format. Imported by robust_ocr_pipeline.py.
 """
 
-import json
 import re
-import os
-
 
 
 # ─────────────────────────────────────────────
-#  FORMATTING HELPERS  (ported from prototype)
+#  Module-level compiled patterns
+# ─────────────────────────────────────────────
+
+_SN_RE = re.compile(r'S/?N\s*[:\-]?\s*([A-Z0-9]+)', re.IGNORECASE)
+_TABLE_HEADER_RE = re.compile(r'^(Ue|Icu|Ics|Uimp|Ui)\b', re.IGNORECASE)
+_VOLTAGE_RE = re.compile(r'^\d+[/\-]?\d*\s*(Vac|Vdc|V)?$', re.IGNORECASE)
+
+
+# ─────────────────────────────────────────────
+#  FORMATTING HELPERS
 # ─────────────────────────────────────────────
 
 def build_table_columns(rows):
@@ -78,15 +84,13 @@ def extract_top_section_fields(top_lines):
     - The longest remaining line that looks like a product name is used
       (excludes single words like brand names, and the S/N line itself)
     """
-    sn_pattern = re.compile(r'S/?N\s*[:\-]?\s*([A-Z0-9]+)', re.IGNORECASE)
-
     serial_number = None
     product_name  = None
     sn_line       = None
 
     # Pass 1 — find S/N
     for line in top_lines:
-        m = sn_pattern.search(line)
+        m = _SN_RE.search(line)
         if m:
             serial_number = m.group(1).strip()
             sn_line = line
@@ -102,9 +106,6 @@ def extract_top_section_fields(top_lines):
 
     return product_name, serial_number
 
-
-# Known electrical-parameter headers (used for orientation detection + filtering)
-_TABLE_HEADER_RE = re.compile(r'^(Ue|Icu|Ics|Uimp|Ui)\b', re.IGNORECASE)
 
 
 def _is_table_header(text):
@@ -153,25 +154,20 @@ def normalize_table(rows):
 
     # --- Trim noise values from the end of each row ---
     # Determine the "true" data width.
-    # Primary: count voltage-pattern values in the Ue row. Voltage values
-    # look like "220-240Vac", "500Vac", "230/240", "690", "250Vdc" etc.
-    # Noise like "Tested at415Vac", "ABB", "IS/IEC 60947-2" is excluded.
+    # Primary: count voltage-pattern values in the Ue row.
     # Fallback: count ALL numeric values in Icu/Ics rows.
     data_width = None
-    voltage_re = re.compile(r'^\d+[/\-]?\d*\s*(Vac|Vdc|V)?$', re.IGNORECASE)
 
-    # Try Ue row first
     for row in filtered:
-        header_lower = row[0].strip().lower()
-        if header_lower.startswith('ue'):
-            data_width = sum(1 for v in row[1:] if voltage_re.match(v.strip()))
+        h = row[0].strip().lower()
+        if h.startswith('ue'):
+            data_width = sum(1 for v in row[1:] if _VOLTAGE_RE.match(v.strip()))
             break
 
-    # Fallback to Icu/Ics — count total numeric values
     if data_width is None:
         for row in filtered:
-            header_lower = row[0].strip().lower()
-            if header_lower.startswith(('icu', 'ics')):
+            h = row[0].strip().lower()
+            if h.startswith(('icu', 'ics')):
                 count = sum(1 for v in row[1:] if re.match(r'^[\d.]+$', v.strip()))
                 if data_width is None or count < data_width:
                     data_width = count
@@ -206,34 +202,26 @@ def extract_embedded_fields(table_rows):
 
     ui_re   = re.compile(r'U[ij]\s*=\s*(\d+\s*V)', re.IGNORECASE)
     uimp_re = re.compile(r'Uimp\s*=\s*(\d+\s*kV)', re.IGNORECASE)
-    sn_re   = re.compile(r'S/?N\s*[:\-]?\s*([A-Z0-9]+)', re.IGNORECASE)
 
     for row in table_rows:
-        # Skip rows that start with a known table header — those are real data
         if row and _is_table_header(row[0]):
             continue
 
         for cell in row:
             # Uimp (check before Ui since "Uimp" contains "Ui")
-            m = uimp_re.search(cell)
-            if m and 'uimp' not in fields:
-                fields['uimp'] = m.group(1).strip()
+            if 'uimp' not in fields:
+                m = uimp_re.search(cell)
+                if m:
+                    fields['uimp'] = m.group(1).strip()
 
-            # Ui (only match if it's NOT a Uimp hit)
+            # Ui — only if the cell doesn't also match Uimp
             if 'ui' not in fields:
                 m = ui_re.search(cell)
                 if m and not uimp_re.search(cell):
                     fields['ui'] = m.group(1).strip()
-                elif m and uimp_re.search(cell):
-                    # Cell has both patterns, e.g. "Tmax XT1C 160 Ui=800V"
-                    # Only take if the Ui match position differs from the Uimp match
-                    ui_match = ui_re.search(cell)
-                    uimp_match = uimp_re.search(cell)
-                    if ui_match and uimp_match and ui_match.start() != uimp_match.start():
-                        fields['ui'] = ui_match.group(1).strip()
 
             # Serial number
-            m = sn_re.search(cell)
+            m = _SN_RE.search(cell)
             if m and 'serial_number' not in fields:
                 fields['serial_number'] = m.group(1).strip()
 
@@ -291,18 +279,11 @@ def format_image_result(raw_data):
         table_dict = build_table_columns(normalized)
 
         # Inject Ui / Uimp from embedded if not already in the table
-        if "ui" in embedded:
-            has_ui = any(
-                k.lower().startswith('ui') and not k.lower().startswith('uimp')
-                for k in table_dict
-            )
-            if not has_ui:
-                table_dict["Ui"] = embedded["ui"]
-
-        if "uimp" in embedded:
-            has_uimp = any(k.lower().startswith('uimp') for k in table_dict)
-            if not has_uimp:
-                table_dict["Uimp"] = embedded["uimp"]
+        tkeys_lower = [k.lower() for k in table_dict]
+        if "ui" in embedded and not any(k.startswith('ui') and not k.startswith('uimp') for k in tkeys_lower):
+            table_dict["Ui"] = embedded["ui"]
+        if "uimp" in embedded and not any(k.startswith('uimp') for k in tkeys_lower):
+            table_dict["Uimp"] = embedded["uimp"]
 
         entry["table_data"] = table_dict
 
