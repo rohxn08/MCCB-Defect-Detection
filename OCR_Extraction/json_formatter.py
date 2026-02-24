@@ -66,8 +66,11 @@ def filter_nulls(data):
         return cleaned
 
     if isinstance(data, list):
-        cleaned = [filter_nulls(i) for i in data]
-        cleaned = [i for i in cleaned if i not in (None, "", "Not Found", [], {})]
+        cleaned = []
+        for i in data:
+            v = filter_nulls(i)
+            if v not in (None, "", "Not Found", [], {}):
+                cleaned.append(v)
         return cleaned
 
     return data
@@ -177,11 +180,8 @@ def normalize_table(rows):
         trimmed = []
         for row in filtered:
             header_lower = row[0].strip().lower()
-            if header_lower.startswith(('ui',)) and not header_lower.startswith(('uimp',)):
-                # Ui has exactly 1 value
-                trimmed.append(row[:2])
-            elif header_lower.startswith('uimp'):
-                # Uimp has exactly 1 value
+            if header_lower.startswith(('ui', 'uimp')):
+                # Ui and Uimp have exactly 1 value
                 trimmed.append(row[:2])
             else:
                 trimmed.append(row[:1 + data_width])
@@ -214,10 +214,10 @@ def extract_embedded_fields(table_rows):
                 if m:
                     fields['uimp'] = m.group(1).strip()
 
-            # Ui — only if the cell doesn't also match Uimp
+            # Ui
             if 'ui' not in fields:
                 m = ui_re.search(cell)
-                if m and not uimp_re.search(cell):
+                if m:
                     fields['ui'] = m.group(1).strip()
 
             # Serial number
