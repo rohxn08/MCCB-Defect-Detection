@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 import re
@@ -7,20 +6,23 @@ import os
 def detect_layout_regions(image_path, output_dir, ocr_lines=None):
     filename = os.path.basename(image_path)
     img = cv2.imread(image_path)
+    img = cv2.rotate(img,cv2.ROTATE_90_COUNTERCLOCKWISE)
     if img is None:
         print(f"Failed to load: {image_path}")
         return None
     
     vis_img = img.copy()
     h, w = img.shape[:2]
+
+    
     
     # Preprocessing to find the Switch (dark object in the middle)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
+    cv2.imwrite("grayUpright.jpg",gray)
     # 1. Thresholding to find dark regions (The switch is usually distinctively dark)
     # Using simple thresholding often works best for the switch vs white label
     # Inverted because we want the dark switch to be white in the binary image
-    _, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    _, thresh = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY_INV)
     
     # 2. Find Contours
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -54,33 +56,18 @@ def detect_layout_regions(image_path, output_dir, ocr_lines=None):
         sx, sy, sw, sh = cv2.boundingRect(switch_contour)
         
         # Define Regions
-        # Table: default start at 10% of image height
-        table_roi_y1 = int(h * 0.1)
+        # Table: Estimate table start relative to the switch position.
+        # The table occupies roughly the area between the top mounting hardware
+        # and the switch. Table typically starts ~20% of image height above the switch.
+        # NOTE: OCR-based refinement is disabled because OCR runs on the original
+        # (non-rotated) image, so its coordinates don't match the rotated layout.
+        table_roi_y1 = max(0, sy - int(h * 0.25))
         table_roi_y2 = sy 
         
-        # If OCR lines are provided, refine table start by finding
-        # the first known electrical-parameter header (Ue, Icu, Ics, Ui, Uimp)
-        if ocr_lines:
-            table_header_pattern = re.compile(r'^(Ue|Icu|Ics|Ui|Uimp)\b', re.IGNORECASE)
-            above_switch = []
-            for line in ocr_lines:
-                box = line[0]
-                text = line[1][0]
-                cy_line = sum([p[1] for p in box]) / 4
-                if cy_line < sy:
-                    above_switch.append({"text": text, "cy": cy_line})
-            above_switch.sort(key=lambda k: k['cy'])
-            
-            for item in above_switch:
-                if table_header_pattern.match(item['text'].strip()):
-                    table_roi_y1 = max(0, int(item['cy']) - 20)
-                    break
-        
-        # Rating: from switch top to bottom 95%
-        # Uses switch TOP (not bottom) because XT-series ratings
-        # are printed on the switch itself
+        # Rating: from switch top to bottom 90%
+        # Covers the switch body area (In= rating) and the bottom table (MIN/MED/MAX)
         rating_roi_y1 = sy
-        rating_roi_y2 = int(h * 0.95)
+        rating_roi_y2 = int(h * 0.90)
         
         # VISUALIZATION
         # Draw Switch Box (Red)

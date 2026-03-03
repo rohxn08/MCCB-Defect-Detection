@@ -3,6 +3,7 @@ from paddleocr import PaddleOCR
 import cv2
 import re
 import os
+import sys
 import numpy as np
 import json
 
@@ -102,8 +103,12 @@ class RobustMCCBPipeline:
         if img is None:
             return None
 
-        # 1. OCR entire image once
-        ocr_result = self.ocr.ocr(image_path, cls=True)
+        # 1. Rotate the image the same way layout_detector does 
+        # so OCR coordinates align perfectly with ROI coordinates
+        img_rotated = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        # 2. OCR the rotated image array instead of the unrotated image path
+        ocr_result = self.ocr.ocr(img_rotated, cls=True)
         if not ocr_result or ocr_result[0] is None:
             print("  No text found.")
             return None
@@ -113,7 +118,8 @@ class RobustMCCBPipeline:
         debug_dir = os.path.join(os.path.dirname(image_path), "debug_pipeline")
         regions = detect_layout_regions(image_path, debug_dir, ocr_lines=all_lines)
         
-        h, w = img.shape[:2]
+        # Use shape of the rotated image because OCR ran on the rotated image!
+        h, w = img_rotated.shape[:2]
         
         if regions:
             # Use layout detector's ROI boundaries directly
@@ -121,7 +127,6 @@ class RobustMCCBPipeline:
             rating_y_min, rating_y_max = regions["rating"]
         else:
             # Fallback
-            h = img.shape[0]
             print("  Warning: Switch not detected. Using full image search.")
             table_y_min, table_y_max = 0, h
             rating_y_min, rating_y_max = 0, h
@@ -150,7 +155,15 @@ if __name__ == "__main__":
     print("  ROBUST MCCB OCR PIPELINE")
     print("="*50)
 
-    choice = input("Do you want to process a single image (1) or a directory (2)? [1/2]: ").strip()
+    while True:
+        try:
+            choice = input("Do you want to process a single image (1) or a directory (2)? [1/2]: ").strip()
+            if choice in ['1', '2']:
+                break
+            print("Invalid choice. Please enter 1 or 2.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            sys.exit(0)
 
     # Adjust path
     project_root = os.getcwd()
