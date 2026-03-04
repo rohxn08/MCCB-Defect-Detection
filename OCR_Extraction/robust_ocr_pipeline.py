@@ -115,7 +115,8 @@ class RobustMCCBPipeline:
         all_lines = ocr_result[0]
 
         # 2. Detect Layout Regions (via layout_detector)
-        debug_dir = os.path.join(os.path.dirname(image_path), "debug_pipeline")
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visualization")
+
         regions = detect_layout_regions(image_path, debug_dir, ocr_lines=all_lines)
         
         # Use shape of the rotated image because OCR ran on the rotated image!
