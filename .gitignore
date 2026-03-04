@@ -5,3 +5,4 @@
 __pycache__/
 *.zip
 /master_images
+*.png
