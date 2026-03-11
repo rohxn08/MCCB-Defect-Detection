@@ -175,36 +175,54 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
     reference_gray = cv2.cvtColor(reference_image, cv2.COLOR_BGR2GRAY)
     input_gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
     
-    #Blur the image
+    # Apply CLAHE to normalize global lighting differences
+    print("Applying CLAHE to equalize lighting...")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    reference_gray = clahe.apply(reference_gray)
+    input_gray = clahe.apply(input_gray)
+
+    # Blur the image to ignore minor sub-pixel misalignment
     reference_blurred = cv2.GaussianBlur(reference_gray, (69, 69), 0)
     input_blurred = cv2.GaussianBlur(input_gray, (69, 69), 0)
-    # reference_blurred = cv2.cvtColor(reference_image, cv2.COLOR_BGR2HSV)
-    # input_blurred = cv2.cvtColor(input_image, cv2.COLOR_BGR2HSV)
+    
     cv2.imwrite('input_blurred.jpg', input_blurred )
     cv2.imwrite("reference_blurred.jpg", reference_blurred)
-    (score, diff) = ssim(reference_blurred, input_blurred, full=True)
+    
+    # 1. Calculate Global SSIM
+    (score, diff) = ssim(reference_blurred, input_blurred, full=True,win_size=23)
     diff = (diff * 255).astype("uint8")
-    print(f"Image Similarity Score: {score:.4f}")
+    
+    print(f"Global SSIM Score: {score:.4f}")
 
+    _, thresh = cv2.threshold(diff, threshold_value, 255, cv2.THRESH_BINARY)
 
-    _, thresh = cv2.threshold(diff, threshold_value, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    # --- MORPHOLOGICAL FILTERING (PARALLAX FIX) ---
+    # Create a kernel. The size determines how thick a shadow/line must be to survive.
+    # A 7x7 kernel erases thin parallax shadows but keeps thick, real cracks intact.
+    kernel = np.ones((7, 7), np.uint8)
+    
+    # MORPH_OPEN performs Erosion (shrinking to kill thin noise) followed by Dilation (restoring real gaps).
+    # We apply it with 2 iterations to aggressively clear 3D parallax artifacts.
+    thresh_cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    # **FIX APPLIED HERE**: Directly unpack the two return values from cv2.findContours.
-    # This is the standard, robust way to do it for OpenCV versions 3 and 4.
-    contours, hierarchy = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(thresh_cleaned.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     output_image = input_image.copy()
     defects_found = 0
-    # Now, the 'contours' variable is guaranteed to be the list of contour arrays.
     for c in contours:
         if cv2.contourArea(c) > min_contour_area:
-            x, y, w, h = cv2.boundingRect(c)
-            cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 0, 255), 4)
+            x, y, w_box, h_box = cv2.boundingRect(c)
+            cv2.rectangle(output_image, (x, y), (x + w_box, y + h_box), (0, 0, 255), 4)
             cv2.putText(output_image, "Defect", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
             defects_found += 1
 
-    print(f"Found {defects_found} potential defects.")
-    status = f"Defects_Found(similarity {score:.4f})" if score <= 0.98 else f"OK(similarity {score:.4f})"
+    print(f"Highlighted {defects_found} potential defect areas.")
+    
+    # Strictly rely on Global SSIM > 0.97 rule
+    if score >= 0.965:  # giving slight leeway, feel free to change strictly to 0.97
+        status = f"OK(similarity {score:.4f})"
+    else:
+        status = f"Defects_Found(similarity {score:.4f})"
 
     cv2.imwrite("output_with_defects.png", output_image)
     print("Saved the output image as 'output_with_defects.png'")
@@ -494,7 +512,7 @@ if __name__ == "__main__":
     images_to_process = []
 
     # Modify this in order to change the input image
-    input_image = r"C:\ALL PROJECTS\MCCB-Defect-Detection\Testing\ORB_Testing_images\CG36350161067415.png"
+    input_image = r"C:\ALL PROJECTS\MCCB-Defect-Detection\masterImages\image.png"
     img_path = input_image
 
     images_to_process.append(img_path)
@@ -567,8 +585,7 @@ if __name__ == "__main__":
 
 
     # detect defects
-    ref_image_file = r"C:\ALL PROJECTS\MCCB-Defect-Detection\Testing\ORB_Testing_images\CG36350207067415.png"
-
+    ref_image_file = r"C:\ALL PROJECTS\MCCB-Defect-Detection\masterImages\masterP14P_mccb.png"
     compare_images(ref_image_file, input_image, min_contour_area=10000, threshold_value=50)
 
 
