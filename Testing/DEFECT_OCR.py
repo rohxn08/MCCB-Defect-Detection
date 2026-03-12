@@ -175,7 +175,9 @@ def align_images(im1, im2, max_features=5000, keep_percent=0.2, crop_margin_pct=
     im2_aligned = cv2.warpPerspective(im2, h, (width, height))
 
     return im2_aligned
+#Image cropping: 20% at the top and 10% at the bottom to be done
 
+    
 # --- 2. The Core Image Comparison Function ---
 def compare_images(reference_image_path, input_image_path, min_contour_area=100, threshold_value=30):
     """
