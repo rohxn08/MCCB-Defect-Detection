@@ -75,17 +75,10 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
     reference_gray = cv2.cvtColor(reference_image, cv2.COLOR_BGR2GRAY)
     input_gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
 
-    # --- IMPROVEMENT: NON-DESTRUCTIVE NORMALIZATION ---
-    print("Normalizing intensities...")
-    # CLAHE helps with local contrast (like reading text under shadows)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    reference_gray = clahe.apply(reference_gray)
-    input_gray = clahe.apply(input_gray)
-
-    # Histogram matching ensures the global brightness curve is identical
-    # --- IMPROVEMENT: INTENSITY NORMALIZATION ONLY ---
+    # --- IMPROVEMENT: INTENSITY NORMALIZATION ---
     print("Normalizing local contrast (preserving part identity)...")
     # CLAHE fixes lighting/shadows without changing the fundamental color (White vs black)
+    # We use a gentle clipLimit=2.0 to avoid over-amplifying sensor noise
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     reference_gray = clahe.apply(reference_gray)
     input_gray = clahe.apply(input_gray)
@@ -228,7 +221,7 @@ if __name__ == "__main__":
     # Update these paths as needed for your tests
     
     master_reference = r"D:\MCCB-Defect-Detection\cropped_master_imaeges\cropped_masterXT13P_mccb.png"
-    latest_test_image =r"D:\MCCB-Defect-Detection\Testing_images\CELK25110319576.png" 
+    latest_test_image =r"Testing_images\XT1_3P.png" 
     
     if os.path.exists(latest_test_image):
         process_test_image(latest_test_image, master_reference)
