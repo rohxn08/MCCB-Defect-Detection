@@ -275,7 +275,7 @@ def align_images(im1, im2):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compare_images(reference_image_path, input_image_path,
-                   min_contour_area=100, threshold_value=50):
+                   min_contour_area=10000, threshold_value=200):
     """
     Compares input image against master reference to detect physical defects.
 
@@ -325,7 +325,7 @@ def compare_images(reference_image_path, input_image_path,
 
     # Step 4: SSIM
     (score, diff) = ssim(reference_blurred, input_blurred,
-                         full=True, win_size=23)
+                         full=True, win_size=25)
     diff_img = (diff * 255).astype("uint8")
 
     # Step 5: Edge mask — ignore border pixels (warp artifacts live here)
@@ -482,7 +482,7 @@ def process_test_image(input_image_path, reference_image_path):
     # ── Compare against master ────────────────────────────────────────────────
     print("\nStep 2: Comparing against master reference...")
     compare_images(reference_image_path, input_for_analysis,
-                   min_contour_area=10000, threshold_value=50)
+                   min_contour_area=10000, threshold_value=200)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -628,8 +628,7 @@ if __name__ == "__main__":
 
     # ── Paths — update as needed ───────────────────────────────────────────────
     MASTER_REFERENCE = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"  # Update for each MCCB model
-    input_image_path=r"Testing_images\CG36350266067415.png"
-
+    input_image_path=r"Testing_images\XT1_3P.png"
     # ── Output directory ───────────────────────────────────────────────────────
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
     os.makedirs(output_dir, exist_ok=True)
