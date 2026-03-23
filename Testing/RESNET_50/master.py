@@ -16,12 +16,12 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # ── CONFIG ────────────────────────────────────────────────
-MASTER_PATH  = r"cropped_master_imaeges\cropped_masterP14P_mccb.png"
-BANK_PATH    = r"banks\P14P.pkl"
-TEST_IMAGE   = r"Testing_images\image.png"
+MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
+BANK_PATH    = r"banks\XT1_3P.pkl"
+TEST_IMAGE   = r"Testing_images\CG36355343067392.png"
 OUTPUT_DIR   = r"output"
 
-THRESHOLD    = 0.16  # ← Tune this. Lower = more sensitive.
+THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
                       #   Good images typically score 0.10–0.20
                       #   Defective images score 0.25+
 # MIN_DEFECT_AREA = 80  # Minimum contour area to count as defect (pixels²)
@@ -126,63 +126,62 @@ def align_to_master(img_raw, master):
 
 @torch.no_grad()
 def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
-    """
-    Run PatchCore anomaly detection.
-    Returns anomaly scores, heatmap, result image, defect count.
-    """
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     tensor  = transform(img_rgb).unsqueeze(0).to(device)
-    feat    = backbone(tensor).squeeze(0).permute(1, 2, 0)  # (14,14,1024)
+    feat    = backbone(tensor).squeeze(0).permute(1, 2, 0)
     h_f, w_f, c_f = feat.shape
     H, W = img_bgr.shape[:2]
-    MIN_DEFECT_AREA = int((H * W) * 0.0005)
-    print(f"  Auto MIN_DEFECT_AREA: {MIN_DEFECT_AREA}px² (for {W}x{H} image)")
 
-    # Normalize test patches
+    MIN_DEFECT_AREA = int((H * W) * 0.001)
+    MAX_DEFECT_AREA = int((H * W) * 0.08)
+
     test_vecs = feat.reshape(-1, c_f)
     test_vecs = test_vecs / (torch.norm(test_vecs, dim=1, keepdim=True) + 1e-6)
 
-    # Cosine distance to memory bank
-    sims   = test_vecs @ memory_bank.T          # (196, N)
-    scores = (1.0 - sims.max(dim=1)[0]).cpu().numpy()  # (196,)
+    sims   = test_vecs @ memory_bank.T
+    scores = (1.0 - sims.max(dim=1)[0]).cpu().numpy()
 
-    anomaly_grid = scores.reshape(h_f, w_f)     # (14, 14)
-    # H, W = img_bgr.shape[:2]
-
-    # Smooth and upscale heatmap
-    smooth = cv2.GaussianBlur(anomaly_grid.astype(np.float32), (3, 3), 0)
+    anomaly_grid = scores.reshape(h_f, w_f)
+    smooth       = cv2.GaussianBlur(anomaly_grid.astype(np.float32), (3, 3), 0)
     heatmap_full = cv2.resize(smooth, (W, H), interpolation=cv2.INTER_LINEAR)
 
-    # Binary mask using fixed threshold
-    mask = (heatmap_full > THRESHOLD).astype(np.uint8) * 255
-
-    # --- EDGE MASKING (3% border exclusion) ---
-    # Warp/alignment always leaves artifacts at the image boundary.
-    # Zero out the outer 3% so those blobs never trigger a contour.
-    border = int(min(H, W) * 0.03)
-    mask[:border, :]    = 0   # top
-    mask[H-border:, :]  = 0   # bottom
-    mask[:, :border]    = 0   # left
-    mask[:, W-border:]  = 0   # right
-
-    # Color heatmap for visualization
+    # Color heatmap
     heatmap_vis = cv2.applyColorMap(
         cv2.normalize(heatmap_full, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
         cv2.COLORMAP_JET
     )
 
-    # Draw bounding boxes
-    out_img   = img_bgr.copy()
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ── Extract DARK RED regions from heatmap ──────────────
+    heatmap_hsv = cv2.cvtColor(heatmap_vis, cv2.COLOR_BGR2HSV)
+
+    lower_dark_red1 = np.array([0,   200, 180])
+    upper_dark_red1 = np.array([8,   255, 255])
+    lower_dark_red2 = np.array([172, 200, 180])
+    upper_dark_red2 = np.array([180, 255, 255])
+
+    mask_r1  = cv2.inRange(heatmap_hsv, lower_dark_red1, upper_dark_red1)
+    mask_r2  = cv2.inRange(heatmap_hsv, lower_dark_red2, upper_dark_red2)
+    red_mask = cv2.bitwise_or(mask_r1, mask_r2)
+
+    # Edge exclusion on red mask
+    border = int(min(H, W) * 0.01)
+    red_mask[:border, :]   = 0
+    red_mask[H-border:, :] = 0
+    red_mask[:, :border]   = 0
+    red_mask[:, W-border:] = 0
+
+    # ── Draw bounding boxes on output image ────────────────
+    out_img  = img_bgr.copy()
+    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     defect_count = 0
 
-    print(f"  Total contours found (before area filter): {len(contours)}")
+    print(f"  Total red contours: {len(contours)}")
     for c in contours:
         area = cv2.contourArea(c)
         x, y, w_b, h_b = cv2.boundingRect(c)
-        print(f"    Contour → x={x:4d}  y={y:4d}  w={w_b:4d}  h={h_b:4d}  area={area:.0f}")
         aspect_ratio = max(w_b, h_b) / (min(w_b, h_b) + 1e-6)
-        if area > MIN_DEFECT_AREA and aspect_ratio < 5.0:  # ← fixed
+        print(f"    Contour → x={x:4d}  y={y:4d}  w={w_b:4d}  h={h_b:4d}  area={area:.0f}")
+        if area > MIN_DEFECT_AREA and area < MAX_DEFECT_AREA and aspect_ratio < 3.0:
             region_score = heatmap_full[y:y+h_b, x:x+w_b].max()
             cv2.rectangle(out_img, (x, y), (x+w_b, y+h_b), (0, 255, 0), 6)
             cv2.putText(out_img, f"DEFECT {region_score:.2f}",
@@ -191,13 +190,11 @@ def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
             defect_count += 1
 
     return {
-        "score":       float(np.max(scores)),
-        "heatmap":     heatmap_vis,
-        "output":      out_img,
-        "defects":     defect_count,
+        "score":   float(np.max(scores)),
+        "heatmap": heatmap_vis,
+        "output":  out_img,
+        "defects": defect_count,
     }
-
-
 # ══════════════════════════════════════════════════════════
 # 5. MAIN
 # ══════════════════════════════════════════════════════════
