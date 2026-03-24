@@ -1,6 +1,14 @@
+import sys
+import os
+
+# Add the project root to sys.path to allow imports from the 'Testing' package
+# The script is located in D:\MCCB-Defect-Detection\Testing\ORB\
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 import cv2
 import numpy as np
-import os
 import re
 import time
 from datetime import datetime
@@ -10,8 +18,8 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 
 
-# Local import from the same folder
-from layout_detector import detect_layout_regions
+# Local import from the Testing folder
+from Testing.layout_detector import detect_layout_regions
 
 # --- 1. Image Alignment Engine ---
 
@@ -223,7 +231,7 @@ def process_test_image(input_image_path, reference_image_path):
 if __name__ == "__main__":
     # Update these paths as needed for your tests
     
-    master_reference = r"D:\MCCB-Defect-Detection\cropped_master_imaeges\cropped_masterP14P_mccb.png"
+    master_reference = r"cropped_master_imaeges\cropped_masterXT14P_mccb.png"
     latest_test_image =r"Testing_images\image.png" 
     
     if os.path.exists(latest_test_image):

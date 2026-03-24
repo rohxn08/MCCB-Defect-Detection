@@ -18,7 +18,7 @@ from datetime import datetime
 # ── CONFIG ────────────────────────────────────────────────
 MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
 BANK_PATH    = r"banks\XT1_3P.pkl"
-TEST_IMAGE   = r"Testing_images\CG36355343067392.png"
+TEST_IMAGE   = r"Testing_images\CG36355365067392.png"
 OUTPUT_DIR   = r"output"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
@@ -187,7 +187,7 @@ def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
             cv2.putText(out_img, f"DEFECT {region_score:.2f}",
                         (x, max(y-12, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-            defect_count += 1
+            defect_count +=1
 
     return {
         "score":   float(np.max(scores)),
