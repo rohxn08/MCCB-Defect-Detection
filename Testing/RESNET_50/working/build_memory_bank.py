@@ -14,10 +14,10 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 
 # ── CONFIG ────────────────────────────────────────────────────────
-REFERENCE_DIR   = r"reference_images\p14p"          # Folder of good MCCB images
-MASTER_PATH     = r"cropped_master_imaeges\cropped_masterP14P_mccb.png" # Cropped master reference
-OUTPUT_BANK     = r"banks\P14P.pkl"                 # Output memory bank path
-MODEL_ID        = "P14P"
+REFERENCE_DIR   = r"reference_images\xt13p"          # Folder of good MCCB images
+MASTER_PATH     = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png" # Cropped master reference
+OUTPUT_BANK     = r"banks\XT13P.pkl"                 # Output memory bank path
+MODEL_ID        = "XT13P"
 # ─────────────────────────────────────────────────────────────────
 
 
@@ -108,7 +108,7 @@ def align_to_master(img_raw, master):
             if H_fine is not None:
                 crop = cv2.warpPerspective(crop, H_fine, (w_m, h_m))
                 return crop
-
+    aligned_img=cv2.resize(crop,(w_m, h_m))
     return cv2.resize(crop, (w_m, h_m))
 
 

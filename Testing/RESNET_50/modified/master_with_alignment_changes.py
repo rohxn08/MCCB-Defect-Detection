@@ -17,9 +17,9 @@ from datetime import datetime
 
 # ── CONFIG ────────────────────────────────────────────────
 MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
-BANK_PATH    = r"banks\XT1_3P.pkl"
-TEST_IMAGE   = r"Testing_images\CG36355365067392.png"
-OUTPUT_DIR   = r"output"
+BANK_PATH    = r"banks\XT13P.pkl"
+TEST_IMAGE   = r"Testing_images\CG36355343067392.png"
+OUTPUT_DIR   = r"030426"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
                       #   Good images typically score 0.10–0.20
@@ -67,9 +67,9 @@ def apply_clahe(img_bgr):
 # ══════════════════════════════════════════════════════════
 
 def align_to_master(img_raw, master):
-    """ORB-based alignment + fine registration to master size."""
-    img = cv2.rotate(img_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
+    img=img_raw
+    # img = cv2.rotate(img_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    
     orb = cv2.ORB_create(10000)
     bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     h_m, w_m = master.shape[:2]
@@ -78,12 +78,10 @@ def align_to_master(img_raw, master):
     kp_t, des_t = orb.detectAndCompute(img, None)
 
     if des_m is None or des_t is None or len(des_t) < 10:
-        print("  ⚠️  Alignment fallback: insufficient keypoints")
         return cv2.resize(img, (w_m, h_m))
 
     matches = sorted(bf.match(des_m, des_t), key=lambda x: x.distance)[:200]
     if len(matches) < 10:
-        print("  ⚠️  Alignment fallback: insufficient matches")
         return cv2.resize(img, (w_m, h_m))
 
     src_pts = np.float32([kp_m[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
@@ -91,9 +89,9 @@ def align_to_master(img_raw, master):
     M, _    = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
     if M is None:
-        print("  ⚠️  Alignment fallback: homography failed")
         return cv2.resize(img, (w_m, h_m))
 
+    # ✅ KEEP — Crop the MCCB out of the jig frame
     corners   = np.float32([[0,0],[0,h_m-1],[w_m-1,h_m-1],[w_m-1,0]]).reshape(-1,1,2)
     t_corners = cv2.perspectiveTransform(corners, M)
     h_t, w_t  = img.shape[:2]
@@ -106,19 +104,8 @@ def align_to_master(img_raw, master):
     if crop.size == 0:
         return cv2.resize(img, (w_m, h_m))
 
-    # Fine registration
-    kp_c, des_c = orb.detectAndCompute(crop, None)
-    if des_c is not None and len(des_c) >= 10:
-        matches_fine = sorted(bf.match(des_c, des_m), key=lambda x: x.distance)[:200]
-        if len(matches_fine) >= 10:
-            pts_c = np.float32([kp_c[m.queryIdx].pt for m in matches_fine]).reshape(-1,1,2)
-            pts_m = np.float32([kp_m[m.trainIdx].pt for m in matches_fine]).reshape(-1,1,2)
-            H_fine, _ = cv2.findHomography(pts_c, pts_m, cv2.RANSAC, 5.0)
-            if H_fine is not None:
-                return cv2.warpPerspective(crop, H_fine, (w_m, h_m))
-
+    # ✅ Just resize — NO fine warpPerspective
     return cv2.resize(crop, (w_m, h_m))
-
 
 # ══════════════════════════════════════════════════════════
 # 4. PATCHCORE DETECTION  (updated — patch-level border masking)
@@ -133,21 +120,28 @@ def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
     H, W = img_bgr.shape[:2]
 
     MIN_DEFECT_AREA = int((H * W) * 0.001)
-    MAX_DEFECT_AREA = int((H * W) * 0.08)
+    MAX_DEFECT_AREA = int((H * W) * 0.04)
 
     test_vecs = feat.reshape(-1, c_f)
     test_vecs = test_vecs / (torch.norm(test_vecs, dim=1, keepdim=True) + 1e-6)
 
     sims   = test_vecs @ memory_bank.T
     scores = (1.0 - sims.max(dim=1)[0]).cpu().numpy()
-
+    raw_max_score = float(np.percentile(scores, 99)) 
+    print(f"\n  Patch score stats:")
+    print(f"    Min  : {scores.min():.4f}")
+    print(f"    Max  : {scores.max():.4f}")
+    print(f"    Mean : {scores.mean():.4f}")
+    print(f"    Std  : {scores.std():.4f}")
+    print(f"    >0.2 : {(scores > 0.2).sum()} / {len(scores)} patches")
+    print(f"    >0.3 : {(scores > 0.3).sum()} / {len(scores)} patches")
     anomaly_grid = scores.reshape(h_f, w_f)
-
+    
     # ── PATCH-LEVEL BORDER MASKING ─────────────────────────
     # Each patch ≈ 16px at 224 scale → 2 patches ≈ 32px
     # Covers the 2-3mm mechanical jig shift causing edge false positives
     # Increase BORDER_PATCHES to 3 if edges still fire
-    BORDER_PATCHES = 2
+    BORDER_PATCHES = 3
     anomaly_grid[:BORDER_PATCHES, :]   = 0   # top
     anomaly_grid[-BORDER_PATCHES:, :]  = 0   # bottom
     anomaly_grid[:, :BORDER_PATCHES]   = 0   # left
@@ -202,7 +196,7 @@ def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
             defect_count += 1
 
     return {
-        "score":   float(np.max(scores)),  # uses pre-mask scores for overall score
+        "score":   raw_max_score,  # uses pre-mask scores for overall score
         "heatmap": heatmap_vis,
         "output":  out_img,
         "defects": defect_count,
@@ -240,6 +234,7 @@ def run():
     # Pipeline
     print(f"\n  1. Aligning to master...")
     aligned = align_to_master(test_img, master)
+    # aligned = cv2.resize(test_img, (master.shape[1], master.shape[0]))
 
     print(f"  2. Applying CLAHE...")
     aligned_clahe = apply_clahe(aligned)
@@ -251,7 +246,7 @@ def run():
     result    = detect(aligned_clahe, memory_bank, patch_grid, device, backbone, transform)
 
     # Result
-    status = "PASS" if result["defects"] == 0 else "FAIL"
+    status = "PASS" if result["score"] <= THRESHOLD else "FAIL"
     color  = "green" if status == "PASS" else "red"
     print(f"\n  Result   : {status}")
     print(f"  Score    : {result['score']:.4f}  (threshold: {THRESHOLD})")
