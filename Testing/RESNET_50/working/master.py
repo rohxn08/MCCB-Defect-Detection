@@ -18,7 +18,7 @@ from datetime import datetime
 # ── CONFIG ────────────────────────────────────────────────
 MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
 BANK_PATH    = r"banks\XT1_3P.pkl"
-TEST_IMAGE   = r"Testing_images\CG36355365067392.png"
+TEST_IMAGE   = r"Testing_images\CG36355343067392.png"
 OUTPUT_DIR   = r"output"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
