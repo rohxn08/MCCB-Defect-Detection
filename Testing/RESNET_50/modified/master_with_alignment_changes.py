@@ -18,8 +18,8 @@ from datetime import datetime
 # ── CONFIG ────────────────────────────────────────────────
 MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
 BANK_PATH    = r"banks\XT13P.pkl"
-TEST_IMAGE   = r"Testing_images\CG36355343067392.png"
-OUTPUT_DIR   = r"030426"
+TEST_IMAGE   = r"Testing_images\XT1_3P.png"
+OUTPUT_DIR   = r"070426"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
                       #   Good images typically score 0.10–0.20
