@@ -18,7 +18,7 @@ from datetime import datetime
 # ── CONFIG ────────────────────────────────────────────────
 MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
 BANK_PATH    = r"banks\XT13P.pkl"
-TEST_IMAGE   = r"Testing_images\XT1_3P.png"
+TEST_IMAGE   = r"Testing_images\CELK25110319576.png"
 OUTPUT_DIR   = r"070426"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
@@ -66,46 +66,108 @@ def apply_clahe(img_bgr):
 # 3. ALIGNMENT
 # ══════════════════════════════════════════════════════════
 
+def spatially_balanced_matches(matches, kp_query, img_shape, grid=4, per_cell=12):
+    """Distribute matches evenly across spatial grid to prevent drift."""
+    h, w = img_shape[:2]
+    cell_h, cell_w = h / grid, w / grid
+    from collections import defaultdict
+    cells = defaultdict(list)
+    for m in matches:
+        pt   = kp_query[m.queryIdx].pt
+        cell = (min(int(pt[1] / cell_h), grid-1), min(int(pt[0] / cell_w), grid-1))
+        cells[cell].append(m)
+    selected = []
+    for cell_matches in cells.values():
+        selected.extend(sorted(cell_matches, key=lambda x: x.distance)[:per_cell])
+    return selected
+
+
+def verify_alignment(aligned, master, threshold=0.5):
+    """NCC-based alignment quality check."""
+    def norm(img):
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g -= g.mean(); g /= (g.std() + 1e-6)
+        return g
+    h, w  = master.shape[:2]
+    score = float(np.sum(norm(aligned) * norm(master)) / (h * w))
+    status = "✅ Good" if score > threshold else "⚠️  Poor"
+    print(f"  Alignment NCC: {score:.3f}  ({status})")
+    return score > threshold, score
+
+
 def align_to_master(img_raw, master):
-    img=img_raw
-    # img = cv2.rotate(img_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    
+    img      = cv2.rotate(img_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)  # match inspect.py
+    h_m, w_m = master.shape[:2]
+
     orb = cv2.ORB_create(10000)
     bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    h_m, w_m = master.shape[:2]
 
     kp_m, des_m = orb.detectAndCompute(master, None)
     kp_t, des_t = orb.detectAndCompute(img, None)
 
-    if des_m is None or des_t is None or len(des_t) < 10:
+    if des_m is None or des_t is None or len(kp_t) < 10:
+        print("  ⚠️  Not enough keypoints — returning resized")
         return cv2.resize(img, (w_m, h_m))
 
-    matches = sorted(bf.match(des_m, des_t), key=lambda x: x.distance)[:200]
+    all_matches = sorted(bf.match(des_m, des_t), key=lambda x: x.distance)
+    matches     = spatially_balanced_matches(all_matches, kp_m, master.shape, grid=4, per_cell=12)
+
     if len(matches) < 10:
+        print("  ⚠️  Not enough balanced matches — returning resized")
         return cv2.resize(img, (w_m, h_m))
 
-    src_pts = np.float32([kp_m[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
-    dst_pts = np.float32([kp_t[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
-    M, _    = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    src_pts = np.float32([kp_m[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_t[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    M, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
     if M is None:
+        print("  ⚠️  Homography failed — returning resized")
         return cv2.resize(img, (w_m, h_m))
 
-    # ✅ KEEP — Crop the MCCB out of the jig frame
-    corners   = np.float32([[0,0],[0,h_m-1],[w_m-1,h_m-1],[w_m-1,0]]).reshape(-1,1,2)
-    t_corners = cv2.perspectiveTransform(corners, M)
-    h_t, w_t  = img.shape[:2]
-    x1 = max(0, int(t_corners[:,0,0].min()))
-    y1 = max(0, int(t_corners[:,0,1].min()))
-    x2 = min(w_t, int(t_corners[:,0,0].max()))
-    y2 = min(h_t, int(t_corners[:,0,1].max()))
+    inliers = inlier_mask.sum() if inlier_mask is not None else 0
+    print(f"    Inliers: {inliers}/{len(matches)} ({inliers/len(matches):.1%})")
 
-    crop = img[y1:y2, x1:x2]
-    if crop.size == 0:
-        return cv2.resize(img, (w_m, h_m))
+    return cv2.warpPerspective(img, M, (w_m, h_m), flags=cv2.WARP_INVERSE_MAP)
+# def align_to_master(img_raw, master):
+#     img=img_raw
+#     # img = cv2.rotate(img_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    
+#     orb = cv2.ORB_create(10000)
+#     bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+#     h_m, w_m = master.shape[:2]
 
-    # ✅ Just resize — NO fine warpPerspective
-    return cv2.resize(crop, (w_m, h_m))
+#     kp_m, des_m = orb.detectAndCompute(master, None)
+#     kp_t, des_t = orb.detectAndCompute(img, None)
+
+#     if des_m is None or des_t is None or len(des_t) < 10:
+#         return cv2.resize(img, (w_m, h_m))
+
+#     matches = sorted(bf.match(des_m, des_t), key=lambda x: x.distance)[:200]
+#     if len(matches) < 10:
+#         return cv2.resize(img, (w_m, h_m))
+
+#     src_pts = np.float32([kp_m[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
+#     dst_pts = np.float32([kp_t[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
+#     M, _    = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+#     if M is None:
+#         return cv2.resize(img, (w_m, h_m))
+
+#     # ✅ KEEP — Crop the MCCB out of the jig frame
+#     corners   = np.float32([[0,0],[0,h_m-1],[w_m-1,h_m-1],[w_m-1,0]]).reshape(-1,1,2)
+#     t_corners = cv2.perspectiveTransform(corners, M)
+#     h_t, w_t  = img.shape[:2]
+#     x1 = max(0, int(t_corners[:,0,0].min()))
+#     y1 = max(0, int(t_corners[:,0,1].min()))
+#     x2 = min(w_t, int(t_corners[:,0,0].max()))
+#     y2 = min(h_t, int(t_corners[:,0,1].max()))
+
+#     crop = img[y1:y2, x1:x2]
+#     if crop.size == 0:
+#         return cv2.resize(img, (w_m, h_m))
+
+#     # ✅ Just resize — NO fine warpPerspective
+#     return cv2.resize(crop, (w_m, h_m))
 
 # ══════════════════════════════════════════════════════════
 # 4. PATCHCORE DETECTION  (updated — patch-level border masking)

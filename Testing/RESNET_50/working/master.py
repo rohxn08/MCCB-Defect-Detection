@@ -16,10 +16,10 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # ── CONFIG ────────────────────────────────────────────────
-MASTER_PATH  = r"cropped_master_imaeges\cropped_masterP14P_mccb.png"
-BANK_PATH    = r"banks\P14P.pkl"
-TEST_IMAGE   = r"Testing_images\image.png"
-OUTPUT_DIR   = r"070426\p14p_r"
+MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
+BANK_PATH    = r"banks\XT13P.pkl"
+TEST_IMAGE   = r"D:\MCCB-Defect-Detection\Testing_images\CG36350267067415.png"
+OUTPUT_DIR   = r"070426\xt13p_r"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
                       #   Good images typically score 0.10–0.20
