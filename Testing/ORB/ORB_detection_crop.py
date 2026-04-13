@@ -23,46 +23,75 @@ from Testing.layout_detector import detect_layout_regions
 
 # --- 1. Image Alignment Engine ---
 
-def align_images(im1, im2, max_features=5000, keep_percent=0.2):
+from collections import defaultdict
+
+
+def spatially_balanced_matches(matches, kp_query, img_shape, grid=4, per_cell=12):
+    """Distribute matches evenly across spatial grid to prevent drift."""
+    h, w = img_shape[:2]
+    cell_h, cell_w = h / grid, w / grid
+    cells = defaultdict(list)
+    for m in matches:
+        pt   = kp_query[m.queryIdx].pt
+        cell = (min(int(pt[1] / cell_h), grid - 1), min(int(pt[0] / cell_w), grid - 1))
+        cells[cell].append(m)
+    selected = []
+    for cell_matches in cells.values():
+        selected.extend(sorted(cell_matches, key=lambda x: x.distance)[:per_cell])
+    return selected
+
+
+def verify_alignment(aligned, master, threshold=0.5):
+    """NCC-based alignment quality check."""
+    def norm(img):
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g -= g.mean()
+        g /= (g.std() + 1e-6)
+        return g
+    h, w  = master.shape[:2]
+    score = float(np.sum(norm(aligned) * norm(master)) / (h * w))
+    status = "Good" if score > threshold else "Poor"
+    print(f"  Alignment NCC: {score:.3f}  ({status})")
+    return score > threshold, score
+
+
+def align_images(master, img_raw):
     """
-    Aligns im2 to match the perspective and position of im1 using ORB feature matching.
+    Aligns img_raw to match the perspective and size of master using
+    spatially-balanced ORB feature matching (mirrors master.py logic).
     """
-    im1_gray = cv2.cvtColor(im1, cv2.COLOR_BGR2GRAY)
-    im2_gray = cv2.cvtColor(im2, cv2.COLOR_BGR2GRAY)
+    img      = img_raw  # caller is responsible for any pre-rotation
+    h_m, w_m = master.shape[:2]
 
-    orb = cv2.ORB_create(max_features)
-    keypoints1, descriptors1 = orb.detectAndCompute(im1_gray, None)
-    keypoints2, descriptors2 = orb.detectAndCompute(im2_gray, None)
+    orb = cv2.ORB_create(10000)
+    bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    if descriptors1 is None or descriptors2 is None:
-        return im2
+    kp_m, des_m = orb.detectAndCompute(master, None)
+    kp_t, des_t = orb.detectAndCompute(img, None)
 
-    matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
-    matches = matcher.match(descriptors2, descriptors1, None)
+    if des_m is None or des_t is None or len(kp_t) < 10:
+        print("  Not enough keypoints — returning resized")
+        return cv2.resize(img, (w_m, h_m))
 
-    matches = sorted(matches, key=lambda x: x.distance)
-    keep = int(len(matches) * keep_percent)
-    matches = matches[:keep]
+    all_matches = sorted(bf.match(des_m, des_t), key=lambda x: x.distance)
+    matches     = spatially_balanced_matches(all_matches, kp_m, master.shape, grid=4, per_cell=12)
 
-    if len(matches) < 4:
-        return im2
+    if len(matches) < 10:
+        print("  Not enough balanced matches — returning resized")
+        return cv2.resize(img, (w_m, h_m))
 
-    pts1 = np.zeros((len(matches), 2), dtype=np.float32)
-    pts2 = np.zeros((len(matches), 2), dtype=np.float32)
+    src_pts = np.float32([kp_m[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_t[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    M, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
-    for i, match in enumerate(matches):
-        pts2[i, :] = keypoints2[match.queryIdx].pt
-        pts1[i, :] = keypoints1[match.trainIdx].pt
+    if M is None:
+        print("  Homography failed — returning resized")
+        return cv2.resize(img, (w_m, h_m))
 
-    h, mask = cv2.findHomography(pts2, pts1, cv2.RANSAC)
-    
-    if h is None:
-        return im2
+    inliers = int(inlier_mask.sum()) if inlier_mask is not None else 0
+    print(f"    Inliers: {inliers}/{len(matches)} ({inliers/len(matches):.1%})")
 
-    height, width, channels = im1.shape
-    im2_aligned = cv2.warpPerspective(im2, h, (width, height))
-
-    return im2_aligned
+    return cv2.warpPerspective(img, M, (w_m, h_m), flags=cv2.WARP_INVERSE_MAP)
 
 # --- 2. Defect Detection Engine ---
 
@@ -80,6 +109,9 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
     print("Aligning input image to reference image...")
     try:
         input_image = align_images(reference_image, input_image)
+        is_good, ncc_score = verify_alignment(input_image, reference_image)
+        if not is_good:
+            print(f"  Warning: Poor alignment (NCC={ncc_score:.3f}) — result may be unreliable")
     except Exception as e:
         print(f"Alignment failed: {e}")
 
@@ -94,65 +126,94 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
     reference_gray = clahe.apply(reference_gray)
     input_gray = clahe.apply(input_gray)
 
-    # Get dimensions for dynamic cleaning further down
+    # Get image dimensions — used to scale all parameters to resolution
     h_blur, w_blur = reference_gray.shape[:2]
+    shorter_dim = min(h_blur, w_blur)
 
-    # Blur to ignore glare and minor textures
-    # --- USING FIXED KERNEL AS REQUESTED ---
-    blur_kernel = (69, 69)
-    print(f"Using fixed blur kernel: {blur_kernel}")
-    
-    reference_blurred = cv2.GaussianBlur(reference_gray, blur_kernel, 0)
-    input_blurred = cv2.GaussianBlur(input_gray, blur_kernel, 0)
+    # --- RESOLUTION-AWARE GAUSSIAN BLUR ---
+    # For 4K images (~3840px wide), we need a larger kernel to smooth sensor noise
+    # without erasing structural features like screws.
+    # ~1% of shorter dimension: 4K→~21px, HD→~10px, small→5px (min)
+    blur_k = max(5, int(shorter_dim * 0.01))
+    if blur_k % 2 == 0: blur_k += 1   # must be odd
+    print(f"Using resolution-aware blur kernel: ({blur_k}, {blur_k})  [image: {w_blur}x{h_blur}]")
+    reference_blurred = cv2.GaussianBlur(reference_gray, (blur_k, blur_k), 0)
+    input_blurred     = cv2.GaussianBlur(input_gray,     (blur_k, blur_k), 0)
 
-    # 1. Calculate Global SSIM
-    (score, diff) = ssim(reference_blurred, input_blurred, full=True, win_size=25)
-    
-    # Scale diff from [-1, 1] to [0, 255] safely
+    # 1. Calculate SSIM — win_size=11 captures local structure at screw scale
+    (score, diff) = ssim(reference_blurred, input_blurred, full=True, win_size=11)
+
+    # Scale diff from [-1, 1] to [0, 255]
+    # Perfect match → diff=1  → diff_img=255
+    # Missing screw → diff≈0  → diff_img≈128
+    # Opposite      → diff=-1 → diff_img=0
     diff_img = (diff * 127.5 + 127.5).astype("uint8")
 
-    # --- IMPROVEMENT: EDGE MASKING ---
+    # --- EDGE MASKING ---
     h, w = diff_img.shape
-    border = int(min(h, w) * 0.03)
+    border = int(shorter_dim * 0.03)
     mask = np.zeros((h, w), dtype=np.uint8)
     mask[border:h-border, border:w-border] = 255
-    
+
     # Recalculate score only within the valid mask region
     score = np.mean((diff[mask == 255] + 1) / 2)
     print(f"Realistic Global SSIM Score: {score:.4f}")
 
-    # Use a tighter threshold to catch color mismatches (White vs Black is a huge change)
+    # Suppress borders in the diff image
     diff_masked = diff_img.copy()
-    diff_masked[mask == 0] = 255 
-    
-    # We use a standard threshold to catch any drop in similarity
+    diff_masked[mask == 0] = 255
+
+    # Threshold: THRESH_BINARY_INV flags pixels where diff_img < threshold_value.
+    # diff_img=175 → local SSIM ≈ 0.37 (missing screw / colour swap territory).
     _, thresh = cv2.threshold(diff_masked, threshold_value, 255, cv2.THRESH_BINARY_INV)
 
-    # --- IMPROVEMENT: DYNAMIC CLEANING KERNEL ---
-    # We scale the 'cleaning' noise filter based on resolution too
-    # Reference width is used to keep sensitivity consistent
-    clean_k_size = int(w_blur * 0.003) 
-    if clean_k_size < 3: clean_k_size = 3
-    if clean_k_size % 2 == 0: clean_k_size += 1
-    
-    kernel = np.ones((clean_k_size, clean_k_size), np.uint8)
-    thresh_cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=3)
+    # --- RESOLUTION-AWARE MORPHOLOGICAL CLEANING ---
+    # ~0.3% of shorter dimension: 4K→~6px, HD→~3px. Capped at 13 to never over-erase.
+    # CRITICAL: only 2 iterations — 5 iterations was erasing real blobs at 4K.
+    clean_k = max(3, min(int(shorter_dim * 0.003), 13))
+    if clean_k % 2 == 0: clean_k += 1
+    print(f"Morphological kernel: {clean_k}px  (2 iterations)")
+    kernel = np.ones((clean_k, clean_k), np.uint8)
+    thresh_cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
 
     contours, _ = cv2.findContours(thresh_cleaned.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Calculate a dynamic min area based on total pixel count (approx 0.01% of area)
-    dynamic_min_area = (h_blur * w_blur) * 0.0001
-    # Use whichever is larger: the user's requirement or our noise floor
-    actual_min_area = max(min_contour_area, dynamic_min_area)
+    # Dynamic min area: 0.1% of image area scales correctly with resolution.
+    # 4K (3840x2160) → ~8,294 px²  ≈ a ~90px diameter circle — about right for a screw.
+    # User-supplied min_contour_area is still honoured if larger.
+    dynamic_min_area = (h_blur * w_blur) * 0.001
+    actual_min_area  = max(min_contour_area, dynamic_min_area)
+    print(f"Min contour area: {actual_min_area:.0f} px²")
+
+    # Max area: blobs larger than 8% of the image are lighting/reflection artefacts (the handle glare).
+    # Same upper bound as master.py.
+    max_defect_area = (h_blur * w_blur) * 0.08
+    # Aspect ratio: real defects (missing screws, wrong parts) are compact, not elongated.
+    # Handle glare: ~269x552 → aspect=2.05. Text strips: 3.4–11.1. Screws: ~1.0–1.5.
+    max_aspect_ratio = 2.0
+    print(f"Area filter: [{actual_min_area:.0f} — {max_defect_area:.0f}] px²  |  max aspect ratio: {max_aspect_ratio}")
 
     output_image = input_image.copy()
     defects_found = 0
     for c in contours:
-        if cv2.contourArea(c) > actual_min_area:
-            x, y, w_box, h_box = cv2.boundingRect(c)
-            cv2.rectangle(output_image, (x, y), (x + w_box, y + h_box), (0, 0, 255), 4)
-            cv2.putText(output_image, "Defect", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-            defects_found += 1
+        area = cv2.contourArea(c)
+        x, y, w_box, h_box = cv2.boundingRect(c)
+        aspect_ratio = max(w_box, h_box) / (min(w_box, h_box) + 1e-6)
+
+        if area < actual_min_area:
+            continue
+        if area > max_defect_area:
+            print(f"  [skip] area={area:.0f}  too large (lighting/reflection blob)")
+            continue
+        if aspect_ratio >= max_aspect_ratio:
+            print(f"  [skip] aspect={aspect_ratio:.1f}  too elongated (text/label strip or handle)")
+            continue
+
+        print(f"  [DEFECT] x={x}  y={y}  w={w_box}  h={h_box}  area={area:.0f}  aspect={aspect_ratio:.2f}")
+        cv2.rectangle(output_image, (x, y), (x + w_box, y + h_box), (0, 0, 255), 4)
+        cv2.putText(output_image, "Defect", (x, max(y - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        defects_found += 1
 
     status = f"OK(similarity {score:.4f})" if score >= 0.95 else f"Defects_Found(similarity {score:.4f})"
     
@@ -186,53 +247,26 @@ def process_test_image(input_image_path, reference_image_path):
     # Flip to CCW rotation
     img_rotated = cv2.rotate(img_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
     
-    # --- VISUAL REFERENCE CROPPING LOGIC ---
-    print("Finding master template region using ORB features...")
-    orb_finder = cv2.ORB_create(10000)
-    kp_m, des_m = orb_finder.detectAndCompute(cropped_master, None)
-    kp_t, des_t = orb_finder.detectAndCompute(img_rotated, None)
-    
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des_m, des_t)
-    matches = sorted(matches, key=lambda x: x.distance)
+    # --- ALIGNMENT CROPPING LOGIC (mirrors master.py align_to_master) ---
+    print("Aligning test image to master using spatially-balanced ORB features...")
+    aligned_test = align_images(cropped_master, img_rotated)
+    is_good, ncc_score = verify_alignment(aligned_test, cropped_master)
+    if not is_good:
+        print(f"  Warning: Poor alignment (NCC={ncc_score:.3f}) — result may be unreliable")
 
-    if len(matches) < 10:
-        print("Error: Not enough features to find the master region. Falling back to full image.")
-        input_for_analysis = input_image_path
-    else:
-        src_pts = np.float32([kp_m[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp_t[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        
-        if M is not None:
-            h_m, w_m = cropped_master.shape[:2]
-            corners = np.float32([[0, 0], [0, h_m-1], [w_m-1, h_m-1], [w_m-1, 0]]).reshape(-1, 1, 2)
-            transformed_corners = cv2.perspectiveTransform(corners, M)
-            
-            x_min, y_min = np.int32(transformed_corners.min(axis=0).ravel())
-            x_max, y_max = np.int32(transformed_corners.max(axis=0).ravel())
-            
-            h_t, w_t = img_rotated.shape[:2]
-            x_min, y_min = max(0, x_min), max(0, y_min)
-            x_max, y_max = min(w_t, x_max), min(h_t, y_max)
-            
-            cropped_test = img_rotated[y_min:y_max, x_min:x_max]
-            cropped_test_path = os.path.join(output_dir, "visual_cropped_" + os.path.basename(input_image_path))
-            cv2.imwrite(cropped_test_path, cropped_test)
-            print(f"Successfully found and cropped test region. Saved to {cropped_test_path}")
-            input_for_analysis = cropped_test_path
-        else:
-            print("Warning: Could not find master region. Using uncropped image.")
-            input_for_analysis = input_image_path
+    cropped_test_path = os.path.join(output_dir, "visual_cropped_" + os.path.basename(input_image_path))
+    cv2.imwrite(cropped_test_path, aligned_test)
+    print(f"Aligned test image saved to {cropped_test_path}")
+    input_for_analysis = cropped_test_path
 
     print(f"\n--- Step 2: Comparing against Master: {os.path.basename(reference_image_path)} ---")
-    compare_images(reference_image_path, input_for_analysis, min_contour_area=1000, threshold_value=50)
+    compare_images(reference_image_path, input_for_analysis, min_contour_area=0, threshold_value=175)
 
 if __name__ == "__main__":
     # Update these paths as needed for your tests
     
-    master_reference = r"cropped_master_imaeges\cropped_masterXT14P_mccb.png"
-    latest_test_image =r"Testing_images\image.png" 
+    master_reference = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
+    latest_test_image =r"Testing_images\CG36355343067392.png" 
     
     if os.path.exists(latest_test_image):
         process_test_image(latest_test_image, master_reference)
