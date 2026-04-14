@@ -131,41 +131,64 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
     shorter_dim = min(h_blur, w_blur)
 
     # --- RESOLUTION-AWARE GAUSSIAN BLUR ---
-    # For 4K images (~3840px wide), we need a larger kernel to smooth sensor noise
-    # without erasing structural features like screws.
-    # ~1% of shorter dimension: 4K→~21px, HD→~10px, small→5px (min)
-    blur_k = max(5, int(shorter_dim * 0.01))
+    # The label/text panel of the MCCB has embossed serial numbers (~2-5px wide at 4K).
+    # A 31px blur (1.5% of shorter dim) suppresses those text differences while keeping
+    # structural features like screw holes (~200-300px diameter at 4K) fully visible.
+    # 1.5% rule:  4K (2068px short) → 31px  |  HD → 15px  |  small → 11px (min)
+    blur_k = max(11, int(shorter_dim * 0.015))
     if blur_k % 2 == 0: blur_k += 1   # must be odd
     print(f"Using resolution-aware blur kernel: ({blur_k}, {blur_k})  [image: {w_blur}x{h_blur}]")
     reference_blurred = cv2.GaussianBlur(reference_gray, (blur_k, blur_k), 0)
     input_blurred     = cv2.GaussianBlur(input_gray,     (blur_k, blur_k), 0)
 
-    # 1. Calculate SSIM — win_size=11 captures local structure at screw scale
-    (score, diff) = ssim(reference_blurred, input_blurred, full=True, win_size=11)
+    # 1. Calculate SSIM — win_size=21 matches the 31px blur scale
+    (score, diff) = ssim(reference_blurred, input_blurred, full=True, win_size=21)
 
-    # Scale diff from [-1, 1] to [0, 255]
-    # Perfect match → diff=1  → diff_img=255
-    # Missing screw → diff≈0  → diff_img≈128
-    # Opposite      → diff=-1 → diff_img=0
-    diff_img = (diff * 127.5 + 127.5).astype("uint8")
-
-    # --- EDGE MASKING ---
-    h, w = diff_img.shape
+    # --- EDGE MASKING (suppress warp artefacts at borders) ---
+    h, w = diff.shape
     border = int(shorter_dim * 0.03)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[border:h-border, border:w-border] = 255
+    edge_mask = np.zeros((h, w), dtype=np.uint8)
+    edge_mask[border:h-border, border:w-border] = 255
 
-    # Recalculate score only within the valid mask region
-    score = np.mean((diff[mask == 255] + 1) / 2)
+    # Global SSIM score for reporting (masked valid region only)
+    score = np.mean((diff[edge_mask == 255] + 1) / 2)
     print(f"Realistic Global SSIM Score: {score:.4f}")
 
-    # Suppress borders in the diff image
-    diff_masked = diff_img.copy()
-    diff_masked[mask == 0] = 255
+    # --- LOCAL ANOMALY SCORING ---
+    # Absolute SSIM thresholding fails when master and test have different
+    # overall brightness/exposure: the ENTIRE image looks 'different' and
+    # everything gets flagged.
+    #
+    # This approach instead asks: is THIS pixel significantly WORSE than its
+    # LOCAL NEIGHBOURHOOD?  Uniform lighting shifts produce anomaly ≈ 0
+    # everywhere (flagged=nothing). A missing screw is locally much worse
+    # than the surrounding plastic surface → anomaly is HIGH → flagged.
+    diff_f = diff.astype(np.float32)
 
-    # Threshold: THRESH_BINARY_INV flags pixels where diff_img < threshold_value.
-    # diff_img=175 → local SSIM ≈ 0.37 (missing screw / colour swap territory).
-    _, thresh = cv2.threshold(diff_masked, threshold_value, 255, cv2.THRESH_BINARY_INV)
+    # Fill borders with the in-region mean so the Gaussian blur isn’t
+    # biased towards 0 at the edges.
+    border_fill = float(np.mean(diff_f[edge_mask == 255]))
+    diff_filled = diff_f.copy()
+    diff_filled[edge_mask == 0] = border_fill
+
+    # Neighbourhood window: ~8% of shorter dim
+    # 4K (shorter=2068) → 165px  |  HD → 82px  |  minimum 51px
+    local_win = max(51, int(shorter_dim * 0.08))
+    if local_win % 2 == 0: local_win += 1
+    print(f"Local anomaly window: {local_win}px")
+    local_mean_diff = cv2.GaussianBlur(diff_filled, (local_win, local_win), 0)
+
+    # anomaly = how much lower (worse) is local SSIM vs neighbourhood?
+    # 0 = no anomaly, 1 = maximally anomalous
+    anomaly   = np.clip(local_mean_diff - diff_f, 0.0, 1.0)
+    anomaly_img = (anomaly * 255).astype("uint8")
+    anomaly_img[edge_mask == 0] = 0   # zero borders
+
+    # threshold_value is now an anomaly score (0-255).
+    # 80  → flag if local SSIM is >0.31 below neighbourhood mean.
+    # Missing screw: anomaly typically 0.5-0.9 → anomaly_img 127-229 → well above 80.
+    # Lighting shift: anomaly ≈ 0 everywhere → nothing flagged.
+    _, thresh = cv2.threshold(anomaly_img, threshold_value, 255, cv2.THRESH_BINARY)
 
     # --- RESOLUTION-AWARE MORPHOLOGICAL CLEANING ---
     # ~0.3% of shorter dimension: 4K→~6px, HD→~3px. Capped at 13 to never over-erase.
@@ -185,13 +208,15 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
     actual_min_area  = max(min_contour_area, dynamic_min_area)
     print(f"Min contour area: {actual_min_area:.0f} px²")
 
-    # Max area: blobs larger than 8% of the image are lighting/reflection artefacts (the handle glare).
-    # Same upper bound as master.py.
-    max_defect_area = (h_blur * w_blur) * 0.08
-    # Aspect ratio: real defects (missing screws, wrong parts) are compact, not elongated.
-    # Handle glare: ~269x552 → aspect=2.05. Text strips: 3.4–11.1. Screws: ~1.0–1.5.
+    # Max area: 1.5% of image captures screws (~250px diam) and small parts,
+    # but rejects the large handle/switch shine blobs (100K-160K px² at 4K).
+    max_defect_area = (h_blur * w_blur) * 0.015
+    # Aspect ratio cap: screws are compact (1.0-1.5), elongated strips > 2.0
     max_aspect_ratio = 2.0
-    print(f"Area filter: [{actual_min_area:.0f} — {max_defect_area:.0f}] px²  |  max aspect ratio: {max_aspect_ratio}")
+    # Fill ratio: solid defects fill >=30% of their bounding box.
+    # Scattered noise merged by morphology fills only 5-15% of its bbox.
+    min_fill_ratio   = 0.30
+    print(f"Area: [{actual_min_area:.0f} — {max_defect_area:.0f}] px²  aspect<{max_aspect_ratio}  fill>{min_fill_ratio}")
 
     output_image = input_image.copy()
     defects_found = 0
@@ -199,17 +224,21 @@ def compare_images(reference_image_path, input_image_path, min_contour_area=100,
         area = cv2.contourArea(c)
         x, y, w_box, h_box = cv2.boundingRect(c)
         aspect_ratio = max(w_box, h_box) / (min(w_box, h_box) + 1e-6)
+        fill_ratio   = area / (w_box * h_box + 1e-6)
 
         if area < actual_min_area:
             continue
         if area > max_defect_area:
-            print(f"  [skip] area={area:.0f}  too large (lighting/reflection blob)")
+            print(f"  [skip] area={area:.0f}  too large (handle/reflective surface)")
             continue
         if aspect_ratio >= max_aspect_ratio:
-            print(f"  [skip] aspect={aspect_ratio:.1f}  too elongated (text/label strip or handle)")
+            print(f"  [skip] aspect={aspect_ratio:.1f}  too elongated")
+            continue
+        if fill_ratio < min_fill_ratio:
+            print(f"  [skip] fill={fill_ratio:.2f}  sparse noise cluster (bbox {w_box}×{h_box})")
             continue
 
-        print(f"  [DEFECT] x={x}  y={y}  w={w_box}  h={h_box}  area={area:.0f}  aspect={aspect_ratio:.2f}")
+        print(f"  [DEFECT] x={x}  y={y}  w={w_box}  h={h_box}  area={area:.0f}  aspect={aspect_ratio:.2f}  fill={fill_ratio:.2f}")
         cv2.rectangle(output_image, (x, y), (x + w_box, y + h_box), (0, 0, 255), 4)
         cv2.putText(output_image, "Defect", (x, max(y - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
@@ -260,7 +289,7 @@ def process_test_image(input_image_path, reference_image_path):
     input_for_analysis = cropped_test_path
 
     print(f"\n--- Step 2: Comparing against Master: {os.path.basename(reference_image_path)} ---")
-    compare_images(reference_image_path, input_for_analysis, min_contour_area=0, threshold_value=175)
+    compare_images(reference_image_path, input_for_analysis, min_contour_area=0, threshold_value=80)
 
 if __name__ == "__main__":
     # Update these paths as needed for your tests
