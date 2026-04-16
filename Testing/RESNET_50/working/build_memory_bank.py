@@ -5,6 +5,7 @@
 # ─────────────────────────────────────────────────────────────────
 
 import os
+import sys
 import cv2
 import pickle
 import numpy as np
@@ -12,21 +13,39 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as transforms
+import faiss
+
+# Fix Windows cp1252 terminal choking on emoji characters
+sys.stdout.reconfigure(encoding='utf-8')
 
 # ── CONFIG ────────────────────────────────────────────────────────
 REFERENCE_DIR   = r"reference_images\xt13p"          # Folder of good MCCB images
 MASTER_PATH     = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png" # Cropped master reference
-OUTPUT_BANK     = r"banks\XT13P.pkl"                 # Output memory bank path
+OUTPUT_BANK     = r"banks\XT13P.pkl"                 # Output memory bank path (kept for backward compat)
+FAISS_DIR       = r"faiss"                            # FAISS index output folder
 MODEL_ID        = "XT13P"
+CORESET_RATIO   = 0.10                                # Keep 10% of patches after coreset
 # ─────────────────────────────────────────────────────────────────
 
+#   RESNET 50
+# def get_backbone(device):
+#     """ResNet50 up to Layer3 → (1024, 14, 14) feature maps."""
+#     resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+#     backbone = nn.Sequential(
+#         resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+#         resnet.layer1, resnet.layer2, resnet.layer3,
+#     ).eval().requires_grad_(False).to(device)
+#     return backbone
 
+
+# WIDE RESNET 50
+
+# AFTER
 def get_backbone(device):
-    """ResNet50 up to Layer3 → (1024, 14, 14) feature maps."""
-    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    wide_resnet = models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V1)
     backbone = nn.Sequential(
-        resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-        resnet.layer1, resnet.layer2, resnet.layer3,
+        wide_resnet.conv1, wide_resnet.bn1, wide_resnet.relu, wide_resnet.maxpool,
+        wide_resnet.layer1, wide_resnet.layer2, wide_resnet.layer3,
     ).eval().requires_grad_(False).to(device)
     return backbone
 
@@ -34,7 +53,7 @@ def get_backbone(device):
 def get_transform():
     return transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
+        transforms.Resize((320, 320)),   # ↑ from 256 — more patches, finer localisation
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -128,13 +147,56 @@ def align_to_master(img_raw, master):
 
 
 def extract_features(img_bgr, backbone, transform, device):
-    """Extract 196 patch vectors of 1024-dim from a single image."""
+    """Extract patch vectors from a single image via WideResNet50 backbone."""
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     tensor  = transform(img_rgb).unsqueeze(0).to(device)
     with torch.no_grad():
-        feat = backbone(tensor).squeeze(0).permute(1, 2, 0)  # (14,14,1024)
+        feat = backbone(tensor).squeeze(0).permute(1, 2, 0)  # (H_f, W_f, C)
     h, w, c = feat.shape
     return feat.reshape(-1, c).cpu().numpy(), (h, w)
+
+
+# ══════════════════════════════════════════════════════════
+# 5. CORESET SUBSAMPLING
+# ══════════════════════════════════════════════════════════
+
+def coreset_subsample(features: np.ndarray, ratio: float = 0.10, seed: int = 42) -> np.ndarray:
+    """
+    Greedy farthest-point coreset subsampling.
+    Keeps the most spatially spread-out patch vectors in feature space,
+    eliminating near-duplicate patches from the memory bank.
+
+    Args:
+        features : L2-normalized patch vectors  (N x C)
+        ratio    : fraction to keep  (0.10 = 10%)
+        seed     : RNG seed for reproducibility
+    Returns:
+        np.ndarray  (k x C)   where k = max(1, int(N * ratio))
+    """
+    n, c = features.shape
+    k    = max(1, int(n * ratio))
+    print(f"  Coreset subsampling : {n} → {k} patches ({ratio*100:.0f}%)")
+
+    rng = np.random.default_rng(seed)
+
+    # Random projection to 128-d speeds up distance computation significantly
+    proj_dim  = min(128, c)
+    proj      = rng.standard_normal((c, proj_dim)).astype(np.float32)
+    proj     /= np.linalg.norm(proj, axis=0, keepdims=True) + 1e-8
+    projected = features @ proj                                # (N, proj_dim)
+
+    # Greedy farthest-point selection
+    selected  = [int(rng.integers(n))]
+    min_dists = np.full(n, np.inf, dtype=np.float32)
+
+    for _ in range(k - 1):
+        last      = selected[-1]
+        delta     = projected - projected[last]                # (N, proj_dim)
+        dists     = np.einsum("ij,ij->i", delta, delta)       # squared L2 per row
+        np.minimum(min_dists, dists, out=min_dists)
+        selected.append(int(np.argmax(min_dists)))
+
+    return features[selected]
 
 
 def build_bank():
@@ -186,14 +248,14 @@ def build_bank():
     if not all_features:
         raise RuntimeError("❌ No features extracted. Check your images.")
 
-    # Stack and normalize for cosine similarity at inference
-    bank      = np.vstack(all_features)                          # (N*196, 1024)
+    # Stack and normalize for cosine similarity
+    bank      = np.vstack(all_features)
     norms     = np.linalg.norm(bank, axis=1, keepdims=True)
     norms[norms == 0] = 1
     bank_norm = bank / norms
 
+    # ── Save PKL (full bank — backward compatibility) ─────────────
     os.makedirs(os.path.dirname(OUTPUT_BANK) if os.path.dirname(OUTPUT_BANK) else ".", exist_ok=True)
-
     with open(OUTPUT_BANK, "wb") as f:
         pickle.dump({
             "memory_bank_normalized": bank_norm,
@@ -201,10 +263,33 @@ def build_bank():
             "model_id":   MODEL_ID,
             "n_images":   len(all_features),
         }, f)
-
     size_mb = os.path.getsize(OUTPUT_BANK) / (1024 * 1024)
-    print(f"\n  Memory bank : {bank_norm.shape}  |  {size_mb:.1f} MB")
-    print(f"  Saved to    : {OUTPUT_BANK}")
+    print(f"\n  PKL bank    : {bank_norm.shape}  |  {size_mb:.1f} MB  →  {OUTPUT_BANK}")
+
+    # ── Adaptive coreset ratio ──────────────────────────────────
+    n_total = len(bank_norm)
+    if n_total < 3_000:
+        effective_ratio = 0.75   # tiny bank  — keep 75%
+    elif n_total < 10_000:
+        effective_ratio = 0.40   # medium bank — keep 40%
+    elif n_total < 30_000:
+        effective_ratio = 0.20   # large bank  — keep 20%
+    else:
+        effective_ratio = CORESET_RATIO  # huge bank — keep 10%
+    print(f"  Bank size {n_total} → adaptive coreset ratio: {effective_ratio*100:.0f}%")
+
+    print()
+    coreset_bank = coreset_subsample(bank_norm, ratio=effective_ratio)
+
+    # ── Build and save FAISS index (coreset bank) ─────────────────
+    os.makedirs(FAISS_DIR, exist_ok=True)
+    faiss_path = os.path.join(FAISS_DIR, f"{MODEL_ID}.index")
+    dim        = coreset_bank.shape[1]
+    index      = faiss.IndexFlatIP(dim)        # Inner product = cosine for normalized vecs
+    index.add(coreset_bank)
+    faiss.write_index(index, faiss_path)
+    idx_mb = os.path.getsize(faiss_path) / (1024 * 1024)
+    print(f"  FAISS index : {index.ntotal} vectors  |  {idx_mb:.1f} MB  →  {faiss_path}")
     print(f"{'='*55}\n")
 
 

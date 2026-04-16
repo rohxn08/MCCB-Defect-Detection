@@ -5,6 +5,7 @@
 # ─────────────────────────────────────────────────────────
 
 import os
+import sys
 import cv2
 import pickle
 import numpy as np
@@ -14,11 +15,16 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 from datetime import datetime
+import faiss
+
+# Fix Windows cp1252 terminal choking on emoji characters
+sys.stdout.reconfigure(encoding='utf-8')
 
 # ── CONFIG ────────────────────────────────────────────────
 MASTER_PATH  = r"cropped_master_imaeges\cropped_masterXT13P_mccb.png"
-BANK_PATH    = r"banks\XT13P.pkl"
-TEST_IMAGE   = r"D:\MCCB-Defect-Detection\Testing_images\CG36350267067415.png"
+BANK_PATH    = r"banks\XT13P.pkl"           # used for metadata (patch_grid) only
+FAISS_PATH   = r"faiss\XT13P.index"         # FAISS coreset index for fast search
+TEST_IMAGE   = r"Testing_images\CG36355374067392.png"
 OUTPUT_DIR   = r"070426\xt13p_r"
 
 THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
@@ -32,11 +38,23 @@ THRESHOLD    = 0.20  # ← Tune this. Lower = more sensitive.
 # 1. BACKBONE
 # ══════════════════════════════════════════════════════════
 
+
+#   Resnet 50 model 
+# def get_backbone(device):
+#     resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+#     backbone = nn.Sequential(
+#         resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+#         resnet.layer1, resnet.layer2, resnet.layer3,
+#     ).eval().requires_grad_(False).to(device)
+#     return backbone
+
+
+#   Wide resnet50 model
 def get_backbone(device):
-    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    wide_resnet = models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V1)
     backbone = nn.Sequential(
-        resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-        resnet.layer1, resnet.layer2, resnet.layer3,
+        wide_resnet.conv1, wide_resnet.bn1, wide_resnet.relu, wide_resnet.maxpool,
+        wide_resnet.layer1, wide_resnet.layer2, wide_resnet.layer3,
     ).eval().requires_grad_(False).to(device)
     return backbone
 
@@ -44,7 +62,7 @@ def get_backbone(device):
 def get_transform():
     return transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
+        transforms.Resize((320, 320)),   # must match build_memory_bank.py
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -133,7 +151,7 @@ def align_to_master(img_raw, master):
 # ══════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
+def detect(img_bgr, faiss_index, patch_grid, device, backbone, transform):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     tensor  = transform(img_rgb).unsqueeze(0).to(device)
     feat    = backbone(tensor).squeeze(0).permute(1, 2, 0)
@@ -145,45 +163,61 @@ def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
 
     test_vecs = feat.reshape(-1, c_f)
     test_vecs = test_vecs / (torch.norm(test_vecs, dim=1, keepdim=True) + 1e-6)
+    test_np   = test_vecs.cpu().numpy()              # FAISS requires numpy float32
 
-    sims   = test_vecs @ memory_bank.T
-    scores = (1.0 - sims.max(dim=1)[0]).cpu().numpy()
+    # FAISS k=1 nearest-neighbour search (inner product = cosine for normalised vecs)
+    sims, _  = faiss_index.search(test_np, k=1)      # sims: (N_patches, 1)
+    scores   = (1.0 - sims[:, 0])                     # anomaly score: 0=normal, 1=defect
 
     anomaly_grid = scores.reshape(h_f, w_f)
     smooth       = cv2.GaussianBlur(anomaly_grid.astype(np.float32), (3, 3), 0)
     heatmap_full = cv2.resize(smooth, (W, H), interpolation=cv2.INTER_LINEAR)
 
-    # Color heatmap
-    heatmap_vis = cv2.applyColorMap(
-        cv2.normalize(heatmap_full, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
-        cv2.COLORMAP_JET
-    )
+    # ── Visualization heatmap (for dashboard only — NOT used for detection) ──
+    heatmap_norm = cv2.normalize(heatmap_full, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    heatmap_vis  = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
 
-    # ── Extract DARK RED regions from heatmap ──────────────
-    heatmap_hsv = cv2.cvtColor(heatmap_vis, cv2.COLOR_BGR2HSV)
+    # ── Direct score threshold ─────────────────────────────────────
+    thresh_map = (heatmap_full > THRESHOLD).astype(np.uint8) * 255
 
-    lower_dark_red1 = np.array([0,   200, 180])
-    upper_dark_red1 = np.array([8,   255, 255])
-    lower_dark_red2 = np.array([172, 200, 180])
-    upper_dark_red2 = np.array([180, 255, 255])
+    # ── Exclusion zones — variable text regions that are never defects ──
+    # These areas contain unit-specific ratings/serial numbers that differ
+    # across MCCBs and will always produce high anomaly scores.
+    # Zones are expressed as fractions of (H, W) so they scale with any image size.
+    exclusion_zones = [
+        # (y_start_frac, y_end_frac, x_start_frac, x_end_frac)
+        (0.10, 0.75, 0.00, 0.12),   # Left ratings panel  (MIN/MED/MAX, In=, I3)
+        (0.80, 1.00, 0.00, 0.15),   # TMD label            (bottom-left text)
+        (0.00, 0.92, 0.82, 1.00),   # Right specs panel    (S/N, voltage table)
+    ]
+    for (ys, ye, xs, xe) in exclusion_zones:
+        thresh_map[int(ys*H):int(ye*H), int(xs*W):int(xe*W)] = 0
 
-    mask_r1  = cv2.inRange(heatmap_hsv, lower_dark_red1, upper_dark_red1)
-    mask_r2  = cv2.inRange(heatmap_hsv, lower_dark_red2, upper_dark_red2)
-    red_mask = cv2.bitwise_or(mask_r1, mask_r2)
-
-    # Edge exclusion on red mask
+    # Edge exclusion
     border = int(min(H, W) * 0.01)
-    red_mask[:border, :]   = 0
-    red_mask[H-border:, :] = 0
-    red_mask[:, :border]   = 0
-    red_mask[:, W-border:] = 0
+    thresh_map[:border, :]   = 0
+    thresh_map[H-border:, :] = 0
+    thresh_map[:, :border]   = 0
+    thresh_map[:, W-border:] = 0
 
-    # ── Draw bounding boxes on output image ────────────────
+    # Morphological cleanup — 5×5 so thin low-severity blobs survive
+    kernel     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh_map = cv2.morphologyEx(thresh_map, cv2.MORPH_CLOSE, kernel)
+    thresh_map = cv2.morphologyEx(thresh_map, cv2.MORPH_OPEN,  kernel)
+
+    # ── Draw bounding boxes ────────────────────────────────────────
     out_img  = img_bgr.copy()
-    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Draw exclusion zones in blue on output for visibility
+    for (ys, ye, xs, xe) in exclusion_zones:
+        cv2.rectangle(out_img,
+                      (int(xs*W), int(ys*H)), (int(xe*W), int(ye*H)),
+                      (255, 140, 0), 3)
+
+    contours, _ = cv2.findContours(thresh_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     defect_count = 0
 
-    print(f"  Total red contours: {len(contours)}")
+    print(f"  Total anomaly contours: {len(contours)}")
     for c in contours:
         area = cv2.contourArea(c)
         x, y, w_b, h_b = cv2.boundingRect(c)
@@ -195,7 +229,7 @@ def detect(img_bgr, memory_bank, patch_grid, device, backbone, transform):
             cv2.putText(out_img, f"DEFECT {region_score:.2f}",
                         (x, max(y-12, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-            defect_count +=1
+            defect_count += 1
 
     return {
         "score":   float(np.max(scores)),
@@ -222,11 +256,16 @@ def run():
     if not os.path.exists(BANK_PATH):
         raise FileNotFoundError(f"❌ Bank not found: {BANK_PATH}\n   Run build_bank.py first!")
 
+    # Load FAISS index (coreset bank)
+    if not os.path.exists(FAISS_PATH):
+        raise FileNotFoundError(f"❌ FAISS index not found: {FAISS_PATH}\n   Run build_memory_bank.py first!")
+    faiss_index = faiss.read_index(FAISS_PATH)
+    print(f"  ✅ FAISS index loaded  ({faiss_index.ntotal} coreset patches)")
+
+    # Load pkl for metadata only
     with open(BANK_PATH, "rb") as f:
         data = pickle.load(f)
-    memory_bank = torch.from_numpy(data["memory_bank_normalized"]).float().to(device)
-    patch_grid  = data.get("patch_grid", (14, 14))
-    print(f"  ✅ Memory bank loaded  ({len(memory_bank)} patches)")
+    patch_grid = data.get("patch_grid", (14, 14))
 
     # Load test image
     test_img = cv2.imread(TEST_IMAGE)
@@ -247,7 +286,7 @@ def run():
     print(f"  3. Running PatchCore detection...")
     backbone  = get_backbone(device)
     transform = get_transform()
-    result    = detect(aligned_clahe, memory_bank, patch_grid, device, backbone, transform)
+    result    = detect(aligned_clahe, faiss_index, patch_grid, device, backbone, transform)
 
     # Result
     status = "PASS" if result["defects"] == 0 else "FAIL"
