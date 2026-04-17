@@ -9,3 +9,4 @@ __pycache__/
 *.jpg
 /Testing/intermediate.py
 *.pkl
+/faiss
